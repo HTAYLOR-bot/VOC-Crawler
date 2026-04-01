@@ -34,4 +34,5 @@ streamlit run app.py
 ## Windows one-click 실행
 - `01_install_and_run_web.bat`: 최초 1회 설치 + 실행
 - `02_run_web.bat`: 이후 실행
+- 웹 입력 날짜는 키인 방식이며 형식은 `YYYY-MM-DD`
 - 자세한 한국어 안내: `README_KR.md`
