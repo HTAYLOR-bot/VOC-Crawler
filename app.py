@@ -4,21 +4,22 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dt_parser
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 WALMART_BASE = "https://www.walmart.com"
 SIZE_REGEX = re.compile(
     r"\b(\d{3}/\d{2}R\d{2}|\d{2,3}x\d{2,3}(?:\.\d+)?R\d{2}|\d{2,3}/\d{2}ZR\d{2})\b",
     re.IGNORECASE,
 )
+MULTI_PRODUCT_SPLIT_REGEX = re.compile(r"\s*[,/]\s*")
 
 
 @dataclass
@@ -84,9 +85,44 @@ def to_iso_date(value: Optional[str]) -> Optional[date]:
     return parsed.date()
 
 
+def parse_relative_date(text: str) -> Optional[date]:
+    if not text:
+        return None
+
+    lowered = text.lower()
+    today = date.today()
+
+    if "today" in lowered or "오늘" in text:
+        return today
+    if "yesterday" in lowered or "어제" in text:
+        return today - timedelta(days=1)
+
+    week_match = re.search(r"(\d+)\s*(week|weeks|주)", lowered)
+    if week_match:
+        return today - timedelta(weeks=int(week_match.group(1)))
+
+    day_match = re.search(r"(\d+)\s*(day|days|일)", lowered)
+    if day_match:
+        return today - timedelta(days=int(day_match.group(1)))
+
+    month_match = re.search(r"(\d+)\s*(month|months|개월)", lowered)
+    if month_match:
+        return today - timedelta(days=30 * int(month_match.group(1)))
+
+    year_match = re.search(r"(\d+)\s*(year|years|년)", lowered)
+    if year_match:
+        return today - timedelta(days=365 * int(year_match.group(1)))
+
+    return None
+
+
 def extract_date_from_review(raw_text: str) -> Optional[date]:
     if not raw_text:
         return None
+
+    relative = parse_relative_date(raw_text)
+    if relative is not None:
+        return relative
 
     candidates = re.findall(
         r"([A-Z][a-z]+\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})",
@@ -108,6 +144,11 @@ def date_in_range(target: Optional[date], from_date: Optional[date], to_date: Op
     if to_date and target > to_date:
         return False
     return True
+
+
+def split_product_keywords(raw_keywords: str) -> List[str]:
+    tokens = [token.strip() for token in MULTI_PRODUCT_SPLIT_REGEX.split(raw_keywords or "")]
+    return [token for token in tokens if token]
 
 
 async def collect_search_products(page: Page, brand: str, keyword: str, max_products: int = 20) -> List[ProductInfo]:
@@ -179,6 +220,52 @@ async def click_if_exists(page: Page, selector: str, timeout_ms: int = 1500) -> 
         return False
 
 
+async def click_if_exists_in_scope(scope, selector: str, timeout_ms: int = 1200) -> bool:
+    try:
+        element = await scope.wait_for_selector(selector, timeout=timeout_ms)
+        await element.click()
+        return True
+    except Exception:
+        return False
+
+
+async def set_reviews_to_newest(page: Page) -> None:
+    for selector in [
+        "button:has-text('Customer reviews')",
+        "a:has-text('Customer reviews')",
+        "button:has-text('사용자 리뷰')",
+    ]:
+        if await click_if_exists(page, selector, timeout_ms=1200):
+            break
+
+    # open sort menu
+    opened_sort_menu = False
+    for selector in [
+        "button:has-text('Most relevant')",
+        "button:has-text('Sort by')",
+        "button:has-text('관련성순')",
+        "[data-testid='reviews-sort']",
+    ]:
+        if await click_if_exists(page, selector, timeout_ms=1500):
+            opened_sort_menu = True
+            break
+
+    # choose newest
+    for selector in [
+        "button:has-text('Newest')",
+        "button:has-text('Newest first')",
+        "li:has-text('Newest')",
+        "li:has-text('Newest first')",
+        "button:has-text('최신 날짜순')",
+    ]:
+        if await click_if_exists(page, selector, timeout_ms=1500):
+            await page.wait_for_timeout(1500)
+            return
+
+    if opened_sort_menu:
+        await page.keyboard.press("Escape")
+
+
 async def open_reviews_section(page: Page) -> None:
     candidates = [
         "a:has-text('ratings')",
@@ -196,38 +283,63 @@ async def open_reviews_section(page: Page) -> None:
     await page.wait_for_timeout(1000)
 
 
-async def expand_all_reviews(page: Page, max_clicks: int = 100) -> None:
-    for _ in range(max_clicks):
+async def expand_visible_review_texts(page: Page) -> None:
+    for _ in range(30):
+        clicked_any = False
+        for selector in [
+            "button:has-text('See more')",
+            "button:has-text('Read more')",
+            "button:has-text('더보기')",
+            "a:has-text('See more')",
+        ]:
+            buttons = await page.query_selector_all(selector)
+            for button in buttons:
+                try:
+                    await button.click()
+                    clicked_any = True
+                    await page.wait_for_timeout(100)
+                except Exception:
+                    continue
+        if not clicked_any:
+            break
+
+
+async def expand_all_reviews(page: Page, max_rounds: int = 300) -> None:
+    no_progress_rounds = 0
+    previous_card_count = 0
+
+    for _ in range(max_rounds):
         clicked = False
         for selector in [
             "button:has-text('View all reviews')",
             "a:has-text('View all reviews')",
-            "button:has-text('See more')",
+            "button:has-text('See more reviews')",
+            "button:has-text('More reviews')",
             "button:has-text('Load more')",
             "button:has-text('Show more')",
+            "button:has-text('리뷰 더보기')",
         ]:
             if await click_if_exists(page, selector, timeout_ms=1200):
                 clicked = True
                 break
 
-        if clicked:
-            continue
+        await expand_visible_review_texts(page)
+        await page.mouse.wheel(0, 3000)
+        await page.wait_for_timeout(1200)
 
-        await page.mouse.wheel(0, 2500)
-        await page.wait_for_timeout(1000)
-        selectors = [
-            "button:has-text('View all reviews')",
-            "button:has-text('See more')",
-            "button:has-text('Load more')",
-            "button:has-text('Show more')",
-        ]
-        button_exists = False
-        for selector in selectors:
-            if await page.query_selector(selector) is not None:
-                button_exists = True
-                break
+        current_cards = await page.query_selector_all(
+            "[data-testid='customer-review'], [itemprop='review'], [data-automation-id='review-card'], article"
+        )
+        current_count = len(current_cards)
 
-        if not button_exists:
+        if clicked or current_count > previous_card_count:
+            no_progress_rounds = 0
+        else:
+            no_progress_rounds += 1
+
+        previous_card_count = current_count
+
+        if no_progress_rounds >= 5:
             break
 
 
@@ -244,13 +356,18 @@ async def scrape_reviews_on_product(
 
     parts = parse_title_fields(product.title, brand_input)
     await open_reviews_section(page)
+    await set_reviews_to_newest(page)
     await expand_all_reviews(page)
+    await expand_visible_review_texts(page)
 
     review_cards = await page.query_selector_all(
         "[data-testid='customer-review'], [itemprop='review'], [data-automation-id='review-card'], article"
     )
 
     for card in review_cards:
+        await click_if_exists_in_scope(card, "button:has-text('See more')", timeout_ms=500)
+        await click_if_exists_in_scope(card, "button:has-text('더보기')", timeout_ms=500)
+
         title_el = await card.query_selector("h3, [data-testid='review-title'], [itemprop='name']")
         text_el = await card.query_selector("[data-testid='review-text'], [itemprop='reviewBody'], p")
         author_el = await card.query_selector("[data-testid='review-author'], [itemprop='author'], span.f6")
@@ -262,11 +379,7 @@ async def scrape_reviews_on_product(
         account_name = (await author_el.inner_text()).strip() if author_el else ""
 
         if rating_el:
-            rating_raw = (
-                (await rating_el.get_attribute("aria-label"))
-                or (await rating_el.inner_text())
-                or ""
-            ).strip()
+            rating_raw = ((await rating_el.get_attribute("aria-label")) or (await rating_el.inner_text()) or "").strip()
             rating_match = re.search(r"(\d+(?:\.\d+)?)", rating_raw)
             rating_value = rating_match.group(1) if rating_match else rating_raw
         else:
@@ -285,8 +398,9 @@ async def scrape_reviews_on_product(
         if upload_date is None:
             upload_date = extract_date_from_review((await card.inner_text()))
 
-        if not date_in_range(upload_date, from_date, to_date):
-            continue
+        if from_date is not None or to_date is not None:
+            if not date_in_range(upload_date, from_date, to_date):
+                continue
 
         rows.append(
             ReviewRow(
@@ -306,13 +420,17 @@ async def scrape_reviews_on_product(
 
 async def crawl_walmart_reviews_async(
     brand: str,
-    product_keyword: str,
+    product_keywords: List[str],
     from_date_text: str,
     to_date_text: str,
     max_products: int,
 ) -> Tuple[pd.DataFrame, List[str]]:
-    from_date = to_iso_date(from_date_text)
-    to_date = to_iso_date(to_date_text) if to_date_text else date.today()
+    from_date = to_iso_date(from_date_text) if from_date_text else None
+    # 요구사항: 시작일 있음 + 종료일 없음 => 오늘까지
+    if from_date is not None and not to_date_text:
+        to_date = date.today()
+    else:
+        to_date = to_iso_date(to_date_text) if to_date_text else None
 
     all_rows: List[ReviewRow] = []
     logs: List[str] = []
@@ -322,27 +440,29 @@ async def crawl_walmart_reviews_async(
         context = await browser.new_context(locale="en-US")
         page = await context.new_page()
 
-        products = await collect_search_products(page, brand=brand, keyword=product_keyword, max_products=max_products)
-        logs.append(f"검색 결과 상품 {len(products)}개를 수집했습니다.")
+        for keyword in product_keywords:
+            logs.append(f"검색 키워드 시작: {keyword}")
+            products = await collect_search_products(page, brand=brand, keyword=keyword, max_products=max_products)
+            logs.append(f"'{keyword}' 검색 결과 상품 {len(products)}개를 수집했습니다.")
 
-        for index, product in enumerate(products, 1):
-            logs.append(f"[{index}/{len(products)}] Crawling: {product.title}")
-            try:
-                rows = await scrape_reviews_on_product(
-                    page=page,
-                    product=product,
-                    brand_input=brand,
-                    from_date=from_date,
-                    to_date=to_date,
-                )
-                all_rows.extend(rows)
-            except Exception as exc:
-                logs.append(f"Failed product: {product.title} ({exc})")
+            for index, product in enumerate(products, 1):
+                logs.append(f"[{keyword}] {index}/{len(products)} Crawling: {product.title}")
+                try:
+                    rows = await scrape_reviews_on_product(
+                        page=page,
+                        product=product,
+                        brand_input=brand,
+                        from_date=from_date,
+                        to_date=to_date,
+                    )
+                    all_rows.extend(rows)
+                except Exception as exc:
+                    logs.append(f"Failed product: {product.title} ({exc})")
 
         await context.close()
         await browser.close()
 
-    df = pd.DataFrame([r.to_dict() for r in all_rows])
+    df = pd.DataFrame([row.to_dict() for row in all_rows])
     if not df.empty:
         df = df.drop_duplicates()
     return df, logs
@@ -376,14 +496,14 @@ def _run_coroutine_in_new_loop(coroutine):
 
 def crawl_walmart_reviews(
     brand: str,
-    product_keyword: str,
+    product_keywords: List[str],
     from_date_text: str,
     to_date_text: str,
     max_products: int,
 ) -> Tuple[pd.DataFrame, List[str]]:
     coroutine = crawl_walmart_reviews_async(
         brand=brand,
-        product_keyword=product_keyword,
+        product_keywords=product_keywords,
         from_date_text=from_date_text,
         to_date_text=to_date_text,
         max_products=max_products,
@@ -407,32 +527,41 @@ def main() -> None:
         col1, col2 = st.columns(2)
         with col1:
             brand = st.text_input("브랜드", placeholder="예: Goodyear")
-            product_keyword = st.text_input("상품명", placeholder="예: Assurance WeatherReady")
+            product_keywords_raw = st.text_input(
+                "상품명(복수 입력 가능)",
+                placeholder="예: Assurance WeatherReady, Eagle Sport / Wrangler",
+            )
         with col2:
-            from_date_text = st.text_input("from (YYYY-MM-DD)", placeholder="2025-01-01")
-            to_date_text = st.text_input("to (YYYY-MM-DD, optional)", placeholder="비우면 현재까지")
+            from_date_text = st.text_input("from (YYYY-MM-DD, optional)", placeholder="비우면 처음 리뷰부터")
+            to_date_text = st.text_input("to (YYYY-MM-DD, optional)", placeholder="비우면 제한 없음(단, from만 입력 시 오늘까지)")
 
-        max_products = st.slider("최대 상품 수", min_value=1, max_value=50, value=15)
+        max_products = st.slider("키워드당 최대 상품 수", min_value=1, max_value=50, value=15)
         submitted = st.form_submit_button("크롤링 시작")
 
     if submitted:
-        if not brand.strip() or not product_keyword.strip() or not from_date_text.strip():
-            st.error("브랜드, 상품명, from 날짜는 필수입니다.")
+        if not brand.strip() or not product_keywords_raw.strip():
+            st.error("브랜드, 상품명은 필수입니다.")
+            return
+
+        product_keywords = split_product_keywords(product_keywords_raw.strip())
+        if not product_keywords:
+            st.error("상품명을 1개 이상 입력해주세요.")
             return
 
         try:
-            _ = to_iso_date(from_date_text)
+            if from_date_text.strip():
+                _ = to_iso_date(from_date_text)
             if to_date_text.strip():
                 _ = to_iso_date(to_date_text)
         except Exception:
             st.error("날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형태로 입력해주세요.")
             return
 
-        with st.spinner("Walmart 리뷰 크롤링 중... (상품/리뷰 수에 따라 시간이 걸릴 수 있습니다)"):
+        with st.spinner("Walmart 리뷰 크롤링 중... (시간이 오래 걸릴 수 있습니다)"):
             started = time.time()
             df, logs = crawl_walmart_reviews(
                 brand=brand.strip(),
-                product_keyword=product_keyword.strip(),
+                product_keywords=product_keywords,
                 from_date_text=from_date_text.strip(),
                 to_date_text=to_date_text.strip(),
                 max_products=max_products,
