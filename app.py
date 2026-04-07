@@ -3,7 +3,7 @@ import platform
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -11,8 +11,9 @@ from urllib.parse import quote_plus
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dt_parser
+from playwright.async_api import ElementHandle, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import ElementHandle, Page, async_playwright
+from playwright.async_api import async_playwright
 
 WALMART_BASE = "https://www.walmart.com"
 SIZE_REGEX = re.compile(
@@ -55,11 +56,18 @@ class ReviewRow:
         }
 
 
+@dataclass
+class CrawlProgress:
+    status: str  # done | paused | error
+    rows: List[Dict[str, str]] = field(default_factory=list)
+    logs: List[str] = field(default_factory=list)
+    keyword_index: int = 0
+    product_index: int = 0
+    reason: str = ""
+
+
 def split_keywords(raw: str) -> List[str]:
     items = [v.strip() for v in re.split(r"[,/]+", raw) if v.strip()]
-    if not items:
-        return []
-    # 중복 제거 (입력 순서 유지)
     deduped = []
     seen = set()
     for item in items:
@@ -79,11 +87,11 @@ def parse_title_fields(raw_title: str, brand_input: str) -> Dict[str, str]:
     lower_brand = brand_input.strip().lower()
 
     if lower_brand and lower_brand in lower_raw:
-        brand_start = lower_raw.index(lower_brand)
-        brand = raw[brand_start : brand_start + len(brand_input)].strip()
-        product_name = (raw[:brand_start] + raw[brand_start + len(brand_input) :]).strip(" -,")
+        start = lower_raw.index(lower_brand)
+        brand = raw[start : start + len(brand_input)].strip()
+        product_name = (raw[:start] + raw[start + len(brand_input) :]).strip(" -,")
     else:
-        brand = brand_input.strip() or ""
+        brand = brand_input.strip()
         product_name = raw
 
     if size:
@@ -103,14 +111,14 @@ def parse_input_date(value: Optional[str]) -> Optional[date]:
 
 
 def extract_relative_date(raw_text: str) -> Optional[date]:
-    text = raw_text.strip()
+    text = (raw_text or "").strip()
     if not text:
         return None
 
-    kr_match = RELATIVE_KR_REGEX.search(text)
-    if kr_match:
-        amount = int(kr_match.group(1))
-        unit = kr_match.group(2)
+    kr = RELATIVE_KR_REGEX.search(text)
+    if kr:
+        amount = int(kr.group(1))
+        unit = kr.group(2)
         if unit == "일":
             return date.today() - timedelta(days=amount)
         if unit == "주":
@@ -120,10 +128,10 @@ def extract_relative_date(raw_text: str) -> Optional[date]:
         if unit == "년":
             return date.today() - timedelta(days=365 * amount)
 
-    en_match = RELATIVE_EN_REGEX.search(text)
-    if en_match:
-        amount = int(en_match.group(1))
-        unit = en_match.group(2).lower()
+    en = RELATIVE_EN_REGEX.search(text)
+    if en:
+        amount = int(en.group(1))
+        unit = en.group(2).lower()
         if unit == "day":
             return date.today() - timedelta(days=amount)
         if unit == "week":
@@ -140,17 +148,17 @@ def extract_date_from_review(raw_text: str) -> Optional[date]:
     if not raw_text:
         return None
 
-    relative = extract_relative_date(raw_text)
-    if relative:
-        return relative
+    rel = extract_relative_date(raw_text)
+    if rel:
+        return rel
 
     candidates = re.findall(
         r"([A-Z][a-z]+\s+\d{1,2},\s+\d{4}|\d{1,2}/\d{1,2}/\d{2,4}|\d{4}-\d{2}-\d{2})",
         raw_text,
     )
-    for candidate in candidates:
+    for value in candidates:
         try:
-            return dt_parser.parse(candidate).date()
+            return dt_parser.parse(value).date()
         except Exception:
             continue
     return None
@@ -166,56 +174,72 @@ def date_in_range(target: Optional[date], from_date: Optional[date], to_date: Op
     return True
 
 
+async def is_captcha_page(page: Page) -> bool:
+    page_text = (await page.content()).lower()
+    keywords = [
+        "captcha",
+        "verify you are human",
+        "press & hold",
+        "robot",
+        "are you a human",
+        "bot check",
+    ]
+    if any(k in page_text for k in keywords):
+        return True
+
+    selector_hits = [
+        "iframe[src*='captcha']",
+        "input[name*='captcha']",
+        "text=Verify you are human",
+        "text=Press & Hold",
+    ]
+    for selector in selector_hits:
+        if await page.query_selector(selector):
+            return True
+    return False
+
+
 async def collect_search_products(page: Page, brand: str, keyword: str, max_products: int = 20) -> List[ProductInfo]:
     query = quote_plus(f"{brand} {keyword}".strip())
-    search_url = f"{WALMART_BASE}/search?q={query}"
-    await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2500)
+    url = f"{WALMART_BASE}/search?q={query}"
+    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await page.wait_for_timeout(2000)
 
-    products: List[ProductInfo] = []
-    seen_urls = set()
-
-    card_selectors = [
+    selectors = [
         "[data-item-id]",
         "div[data-type='items'] > div",
         "[data-testid='list-view'] [role='listitem']",
         "[data-automation-id='product-tile']",
     ]
-
     cards = []
-    for selector in card_selectors:
+    for selector in selectors:
         cards = await page.query_selector_all(selector)
         if cards:
             break
 
+    products: List[ProductInfo] = []
+    seen = set()
     for card in cards:
-        link = await card.query_selector("a[href*='/ip/']")
-        if link is None:
-            link = await card.query_selector("a")
-        if link is None:
+        link = await card.query_selector("a[href*='/ip/']") or await card.query_selector("a")
+        if not link:
             continue
 
         href = await link.get_attribute("href") or ""
         if not href:
             continue
 
-        if href.startswith("/"):
-            url = WALMART_BASE + href.split("?")[0]
-        else:
-            url = href.split("?")[0]
-
-        if "/ip/" not in url:
+        url = WALMART_BASE + href.split("?")[0] if href.startswith("/") else href.split("?")[0]
+        if "/ip/" not in url or url in seen:
             continue
 
         title = (await link.inner_text()).strip()
         if not title:
-            title_el = await card.query_selector("span[data-automation-id='product-title']")
-            title = (await title_el.inner_text()).strip() if title_el else ""
-
-        if not title or url in seen_urls:
+            t = await card.query_selector("span[data-automation-id='product-title']")
+            title = (await t.inner_text()).strip() if t else ""
+        if not title:
             continue
 
-        seen_urls.add(url)
+        seen.add(url)
         products.append(ProductInfo(title=title, url=url))
         if len(products) >= max_products:
             break
@@ -223,19 +247,17 @@ async def collect_search_products(page: Page, brand: str, keyword: str, max_prod
     return products
 
 
-async def click_if_exists(page: Page, selector: str, timeout_ms: int = 1500) -> bool:
+async def click_if_exists(page: Page, selector: str, timeout_ms: int = 1200) -> bool:
     try:
-        element = await page.wait_for_selector(selector, timeout=timeout_ms)
-        await element.click()
-        await page.wait_for_timeout(1000)
+        el = await page.wait_for_selector(selector, timeout=timeout_ms)
+        await el.click()
+        await page.wait_for_timeout(800)
         return True
-    except PlaywrightTimeoutError:
-        return False
     except Exception:
         return False
 
 
-async def click_all_expand_buttons_in_reviews(page: Page) -> None:
+async def click_review_expand_buttons(page: Page) -> None:
     selectors = [
         "button:has-text('Read more')",
         "button:has-text('Show more')",
@@ -243,19 +265,15 @@ async def click_all_expand_buttons_in_reviews(page: Page) -> None:
         "span:has-text('Read more')",
     ]
     for selector in selectors:
-        buttons = await page.query_selector_all(selector)
-        for button in buttons:
+        for button in await page.query_selector_all(selector):
             try:
                 await button.click()
-                await page.wait_for_timeout(100)
             except Exception:
-                continue
+                pass
 
 
 async def open_reviews_section_and_sort_latest(page: Page) -> None:
-    # 리뷰 구역으로 이동
-    moved = False
-    review_entry_candidates = [
+    for selector in [
         "a:has-text('사용자 리뷰')",
         "button:has-text('사용자 리뷰')",
         "a:has-text('Customer reviews')",
@@ -263,36 +281,27 @@ async def open_reviews_section_and_sort_latest(page: Page) -> None:
         "a:has-text('ratings')",
         "button:has-text('ratings')",
         "a[href*='#reviews']",
-    ]
-    for selector in review_entry_candidates:
+    ]:
         if await click_if_exists(page, selector):
-            moved = True
             break
 
-    if not moved:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.55)")
-        await page.wait_for_timeout(1200)
-
-    # 정렬 변경: 관련성순 -> 최신 날짜순
-    sort_openers = [
+    for opener in [
         "button:has-text('관련성순')",
         "button:has-text('Relevance')",
         "button[aria-label*='Sort']",
         "select[name*='sort']",
-    ]
-
-    for opener in sort_openers:
+    ]:
         target = await page.query_selector(opener)
-        if target is None:
+        if not target:
             continue
 
-        tag_name = (await target.evaluate("el => el.tagName")).lower()
-        if tag_name == "select":
+        tag = (await target.evaluate("el => el.tagName")).lower()
+        if tag == "select":
             try:
-                await target.select_option(label="최신 날짜순")
+                await target.select_option(label="Most recent")
             except Exception:
                 try:
-                    await target.select_option(label="Most recent")
+                    await target.select_option(label="최신 날짜순")
                 except Exception:
                     pass
             await page.wait_for_timeout(1000)
@@ -300,32 +309,30 @@ async def open_reviews_section_and_sort_latest(page: Page) -> None:
 
         try:
             await target.click()
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(700)
         except Exception:
             continue
 
-        latest_options = [
-            "[role='option']:has-text('최신 날짜순')",
+        for option in [
             "[role='option']:has-text('Most recent')",
-            "button:has-text('최신 날짜순')",
             "button:has-text('Most recent')",
-            "li:has-text('최신 날짜순')",
             "li:has-text('Most recent')",
-        ]
-        for option in latest_options:
-            if await click_if_exists(page, option, timeout_ms=1200):
-                await page.wait_for_timeout(1500)
+            "[role='option']:has-text('최신 날짜순')",
+            "button:has-text('최신 날짜순')",
+            "li:has-text('최신 날짜순')",
+        ]:
+            if await click_if_exists(page, option):
+                await page.wait_for_timeout(1200)
                 return
 
 
-async def get_expected_review_count(page: Page) -> Optional[int]:
-    selectors = [
+async def expected_review_count(page: Page) -> Optional[int]:
+    for selector in [
         "a:has-text('ratings')",
         "button:has-text('ratings')",
         "span:has-text('ratings')",
         "h2:has-text('Customer reviews')",
-    ]
-    for selector in selectors:
+    ]:
         el = await page.query_selector(selector)
         if not el:
             continue
@@ -336,27 +343,21 @@ async def get_expected_review_count(page: Page) -> Optional[int]:
     return None
 
 
-async def expand_all_reviews(page: Page, max_clicks: int = 800) -> None:
-    expected_count = await get_expected_review_count(page)
-    stagnant_rounds = 0
-    last_review_card_count = 0
+async def expand_all_reviews(page: Page, max_rounds: int = 900) -> None:
+    expected = await expected_review_count(page)
+    stagnant = 0
+    prev_count = 0
 
-    for _ in range(max_clicks):
-        await click_all_expand_buttons_in_reviews(page)
+    for _ in range(max_rounds):
+        await click_review_expand_buttons(page)
 
         cards = await page.query_selector_all(
             "[data-testid='customer-review'], [itemprop='review'], [data-automation-id='review-card'], article"
         )
-        current_count = len(cards)
+        curr_count = len(cards)
 
-        if expected_count and current_count >= expected_count:
+        if expected and curr_count >= expected:
             break
-
-        if current_count <= last_review_card_count:
-            stagnant_rounds += 1
-        else:
-            stagnant_rounds = 0
-            last_review_card_count = current_count
 
         clicked = False
         for selector in [
@@ -371,21 +372,25 @@ async def expand_all_reviews(page: Page, max_clicks: int = 800) -> None:
                 clicked = True
                 break
 
-        if not clicked:
-            await page.mouse.wheel(0, 3200)
-            await page.wait_for_timeout(1200)
+        if curr_count <= prev_count and not clicked:
+            stagnant += 1
+        else:
+            stagnant = 0
+            prev_count = curr_count
 
-        if stagnant_rounds >= 4 and not clicked:
+        if stagnant >= 4:
             break
+
+        await page.mouse.wheel(0, 3000)
+        await page.wait_for_timeout(1000)
 
 
 async def extract_source_from_card(card: ElementHandle) -> str:
-    source_selectors = [
+    for selector in [
         "span:has-text('에서 작성된 리뷰')",
         "span:has-text('review from')",
         "[data-testid='review-source']",
-    ]
-    for selector in source_selectors:
+    ]:
         el = await card.query_selector(selector)
         if el:
             txt = (await el.inner_text()).strip()
@@ -408,18 +413,21 @@ async def scrape_reviews_on_product(
 ) -> List[ReviewRow]:
     rows: List[ReviewRow] = []
     await page.goto(product.url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(1200)
+
+    if await is_captcha_page(page):
+        raise RuntimeError("CAPTCHA_REQUIRED")
 
     parts = parse_title_fields(product.title, brand_input)
     await open_reviews_section_and_sort_latest(page)
     await expand_all_reviews(page)
-    await click_all_expand_buttons_in_reviews(page)
+    await click_review_expand_buttons(page)
 
-    review_cards = await page.query_selector_all(
+    cards = await page.query_selector_all(
         "[data-testid='customer-review'], [itemprop='review'], [data-automation-id='review-card'], article"
     )
 
-    for card in review_cards:
+    for card in cards:
         title_el = await card.query_selector("h3, [data-testid='review-title'], [itemprop='name']")
         text_el = await card.query_selector("[data-testid='review-text'], [itemprop='reviewBody'], p")
         author_el = await card.query_selector("[data-testid='review-author'], [itemprop='author'], span.f6")
@@ -430,16 +438,11 @@ async def scrape_reviews_on_product(
         review_text = (await text_el.inner_text()).strip() if text_el else ""
         account_name = (await author_el.inner_text()).strip() if author_el else ""
 
+        rating_val = ""
         if rating_el:
-            rating_raw = (
-                (await rating_el.get_attribute("aria-label"))
-                or (await rating_el.inner_text())
-                or ""
-            ).strip()
-            rating_match = re.search(r"(\d+(?:\.\d+)?)", rating_raw)
-            rating_value = rating_match.group(1) if rating_match else rating_raw
-        else:
-            rating_value = ""
+            rating_raw = ((await rating_el.get_attribute("aria-label")) or (await rating_el.inner_text()) or "").strip()
+            m = re.search(r"(\d+(?:\.\d+)?)", rating_raw)
+            rating_val = m.group(1) if m else rating_raw
 
         upload_raw = ""
         if date_el:
@@ -450,8 +453,8 @@ async def scrape_reviews_on_product(
                 or ""
             ).strip()
 
-        card_text = await card.inner_text()
-        upload_date = extract_date_from_review(upload_raw) or extract_date_from_review(card_text)
+        whole = await card.inner_text()
+        upload_date = extract_date_from_review(upload_raw) or extract_date_from_review(whole)
 
         if not date_in_range(upload_date, from_date, to_date):
             continue
@@ -463,7 +466,7 @@ async def scrape_reviews_on_product(
                 size=parts["size"],
                 upload_date=upload_date.isoformat() if upload_date else "",
                 account_name=account_name,
-                rating=rating_value,
+                rating=rating_val,
                 review_title=review_title,
                 review_text=review_text,
                 source=await extract_source_from_card(card),
@@ -479,55 +482,82 @@ async def crawl_walmart_reviews_async(
     from_date_text: str,
     to_date_text: str,
     max_products: int,
-) -> Tuple[pd.DataFrame, List[str]]:
+    start_keyword_index: int = 0,
+    start_product_index: int = 0,
+    existing_rows: Optional[List[Dict[str, str]]] = None,
+    existing_logs: Optional[List[str]] = None,
+) -> CrawlProgress:
     from_date = parse_input_date(from_date_text)
     to_date = parse_input_date(to_date_text)
 
     if from_date and to_date and from_date > to_date:
         raise ValueError("from 날짜가 to 날짜보다 늦습니다.")
 
-    all_rows: List[ReviewRow] = []
-    logs: List[str] = []
+    rows = existing_rows[:] if existing_rows else []
+    logs = existing_logs[:] if existing_logs else []
 
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
         context = await browser.new_context(locale="en-US")
         page = await context.new_page()
 
-        for keyword in product_keywords:
-            products = await collect_search_products(page, brand=brand, keyword=keyword, max_products=max_products)
-            logs.append(f"[{keyword}] 검색 결과 상품 {len(products)}개")
+        try:
+            for k_idx in range(start_keyword_index, len(product_keywords)):
+                keyword = product_keywords[k_idx]
+                products = await collect_search_products(page, brand=brand, keyword=keyword, max_products=max_products)
 
-            for index, product in enumerate(products, 1):
-                logs.append(f"[{keyword}] {index}/{len(products)}: {product.title}")
-                try:
-                    rows = await scrape_reviews_on_product(
-                        page=page,
-                        product=product,
-                        brand_input=brand,
-                        from_date=from_date,
-                        to_date=to_date,
+                if await is_captcha_page(page):
+                    logs.append("CAPTCHA 감지: Walmart 창에서 사람 인증 완료 후 Resume을 누르세요.")
+                    return CrawlProgress(
+                        status="paused",
+                        rows=rows,
+                        logs=logs,
+                        keyword_index=k_idx,
+                        product_index=0,
+                        reason="captcha",
                     )
-                    all_rows.extend(rows)
-                except Exception as exc:
-                    logs.append(f"[{keyword}] 실패: {product.title} ({exc})")
 
-        await context.close()
-        await browser.close()
+                logs.append(f"[{keyword}] 검색 상품 {len(products)}개")
+                p_start = start_product_index if k_idx == start_keyword_index else 0
 
-    df = pd.DataFrame([row.to_dict() for row in all_rows])
-    if not df.empty:
-        df = df.drop_duplicates()
-    return df, logs
+                for p_idx in range(p_start, len(products)):
+                    product = products[p_idx]
+                    logs.append(f"[{keyword}] {p_idx + 1}/{len(products)} 처리: {product.title}")
+                    try:
+                        product_rows = await scrape_reviews_on_product(
+                            page=page,
+                            product=product,
+                            brand_input=brand,
+                            from_date=from_date,
+                            to_date=to_date,
+                        )
+                        rows.extend([r.to_dict() for r in product_rows])
+                    except RuntimeError as exc:
+                        if str(exc) == "CAPTCHA_REQUIRED":
+                            logs.append("CAPTCHA 감지: Walmart 창에서 사람 인증 완료 후 Resume을 누르세요.")
+                            return CrawlProgress(
+                                status="paused",
+                                rows=rows,
+                                logs=logs,
+                                keyword_index=k_idx,
+                                product_index=p_idx,
+                                reason="captcha",
+                            )
+                        logs.append(f"오류(런타임): {product.title} / {exc}")
+                    except Exception as exc:
+                        logs.append(f"오류: {product.title} / {exc}")
+
+            df = pd.DataFrame(rows).drop_duplicates() if rows else pd.DataFrame()
+            return CrawlProgress(status="done", rows=df.to_dict("records"), logs=logs)
+        finally:
+            await context.close()
+            await browser.close()
 
 
 def _run_coroutine_in_new_loop(coroutine):
     payload: Dict[str, object] = {}
 
     def _runner() -> None:
-        if platform.system() == "Windows" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -547,28 +577,28 @@ def _run_coroutine_in_new_loop(coroutine):
     return payload.get("result")
 
 
-def crawl_walmart_reviews(
-    brand: str,
-    product_keywords: List[str],
-    from_date_text: str,
-    to_date_text: str,
-    max_products: int,
-) -> Tuple[pd.DataFrame, List[str]]:
-    coroutine = crawl_walmart_reviews_async(
-        brand=brand,
-        product_keywords=product_keywords,
-        from_date_text=from_date_text,
-        to_date_text=to_date_text,
-        max_products=max_products,
-    )
-
-    if platform.system() == "Windows":
-        return _run_coroutine_in_new_loop(coroutine)
-
+def crawl_walmart_reviews(**kwargs) -> CrawlProgress:
+    coroutine = crawl_walmart_reviews_async(**kwargs)
     try:
         return asyncio.run(coroutine)
     except RuntimeError:
         return _run_coroutine_in_new_loop(coroutine)
+
+
+def show_dataframe_and_download(rows: List[Dict[str, str]]) -> None:
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.drop_duplicates()
+
+    st.success(f"완료! {len(df):,}개 리뷰 수집")
+    if df.empty:
+        st.info("조건에 맞는 리뷰가 없습니다.")
+        return
+
+    st.dataframe(df, use_container_width=True)
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    file_name = f"walmart_reviews_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    st.download_button("CSV 다운로드", data=csv_bytes, file_name=file_name, mime="text/csv")
 
 
 def main() -> None:
@@ -576,23 +606,23 @@ def main() -> None:
     st.title("🛒 Walmart 미국 리뷰 크롤러")
     st.caption("브랜드/상품명 기반으로 리뷰를 크롤링하고 CSV로 다운로드하세요.")
 
+    if "crawl_state" not in st.session_state:
+        st.session_state.crawl_state = None
+
     with st.form("crawler_form"):
         col1, col2 = st.columns(2)
         with col1:
             brand = st.text_input("브랜드", placeholder="예: Goodyear")
-            product_keyword_raw = st.text_input(
-                "상품명(복수 입력 가능)",
-                placeholder="예: Assurance WeatherReady, Eagle Touring / Wrangler",
-            )
+            raw_keywords = st.text_input("상품명(복수 입력 가능)", placeholder="예: A, B / C")
         with col2:
             from_date_text = st.text_input("from (YYYY-MM-DD, optional)", placeholder="비우면 전체 기간")
             to_date_text = st.text_input("to (YYYY-MM-DD, optional)", placeholder="비우면 오늘까지")
 
         max_products = st.slider("상품명당 최대 상품 수", min_value=1, max_value=50, value=15)
-        submitted = st.form_submit_button("크롤링 시작")
+        start_clicked = st.form_submit_button("크롤링 시작")
 
-    if submitted:
-        if not brand.strip() or not product_keyword_raw.strip():
+    if start_clicked:
+        if not brand.strip() or not raw_keywords.strip():
             st.error("브랜드와 상품명은 필수입니다.")
             return
 
@@ -600,48 +630,69 @@ def main() -> None:
             _ = parse_input_date(from_date_text)
             _ = parse_input_date(to_date_text)
         except Exception:
-            st.error("날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형태로 입력해주세요.")
+            st.error("날짜 형식은 YYYY-MM-DD 로 입력하세요.")
             return
 
-        keywords = split_keywords(product_keyword_raw)
+        keywords = split_keywords(raw_keywords)
         if not keywords:
-            st.error("상품명을 1개 이상 입력해주세요.")
+            st.error("상품명을 1개 이상 입력하세요.")
             return
 
-        with st.spinner("Walmart 리뷰 크롤링 중... (시간이 오래 걸릴 수 있습니다)"):
-            started = time.time()
-            try:
-                df, logs = crawl_walmart_reviews(
-                    brand=brand.strip(),
-                    product_keywords=keywords,
-                    from_date_text=from_date_text.strip(),
-                    to_date_text=to_date_text.strip(),
-                    max_products=max_products,
+        st.session_state.crawl_state = {
+            "brand": brand.strip(),
+            "keywords": keywords,
+            "from_date_text": from_date_text.strip(),
+            "to_date_text": to_date_text.strip(),
+            "max_products": max_products,
+            "keyword_index": 0,
+            "product_index": 0,
+            "rows": [],
+            "logs": [],
+            "status": "running",
+        }
+
+    state = st.session_state.crawl_state
+
+    if state and state.get("status") in {"running", "paused"}:
+        if state.get("status") == "paused":
+            st.warning("CAPTCHA 인증이 필요합니다. Walmart 브라우저 창에서 인증 완료 후 Resume을 누르세요.")
+
+        run_now = state.get("status") == "running"
+        resume_now = st.button("Resume", disabled=state.get("status") != "paused")
+
+        if run_now or resume_now:
+            with st.spinner("크롤링 진행 중... CAPTCHA가 나오면 브라우저에서 인증 후 Resume을 눌러주세요."):
+                started = time.time()
+                progress = crawl_walmart_reviews(
+                    brand=state["brand"],
+                    product_keywords=state["keywords"],
+                    from_date_text=state["from_date_text"],
+                    to_date_text=state["to_date_text"],
+                    max_products=state["max_products"],
+                    start_keyword_index=state["keyword_index"],
+                    start_product_index=state["product_index"],
+                    existing_rows=state["rows"],
+                    existing_logs=state["logs"],
                 )
-            except ValueError as exc:
-                st.error(str(exc))
-                return
-            elapsed = time.time() - started
+                elapsed = time.time() - started
 
-        for line in logs:
-            st.write(line)
+            state["rows"] = progress.rows
+            state["logs"] = progress.logs
+            state["keyword_index"] = progress.keyword_index
+            state["product_index"] = progress.product_index
+            state["status"] = progress.status
 
-        st.success(f"완료! {len(df):,}개 리뷰 수집 (소요: {elapsed:.1f}초)")
+            st.info(f"최근 실행 소요: {elapsed:.1f}초")
 
-        if df.empty:
-            st.info("조건에 맞는 리뷰가 없습니다.")
-            return
+            for line in state["logs"][-30:]:
+                st.write(line)
 
-        st.dataframe(df, use_container_width=True)
-
-        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        file_name = f"walmart_reviews_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        st.download_button(
-            label="CSV 다운로드",
-            data=csv_bytes,
-            file_name=file_name,
-            mime="text/csv",
-        )
+            if progress.status == "done":
+                show_dataframe_and_download(state["rows"])
+            elif progress.status == "paused":
+                st.warning("일시정지됨: CAPTCHA 해결 후 Resume 버튼을 눌러 재개하세요.")
+            else:
+                st.error("크롤링 중 오류가 발생했습니다.")
 
 
 if __name__ == "__main__":
