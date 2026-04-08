@@ -1,9 +1,11 @@
+import asyncio
 import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from io import StringIO
+import sys
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus
 
@@ -202,6 +204,12 @@ class GoogleShoppingCrawler:
             self.state.status = "running"
 
         try:
+            if sys.platform.startswith("win"):
+                try:
+                    loop = asyncio.ProactorEventLoop()
+                    asyncio.set_event_loop(loop)
+                except Exception:
+                    pass
             self._crawl()
             with self._lock:
                 self.state.status = "done"
@@ -216,7 +224,7 @@ class GoogleShoppingCrawler:
     def _crawl(self) -> None:
         from_date = parse_date_input(self.config.from_date_text)
         to_date = parse_date_input(self.config.to_date_text)
-        today = datetime.utcnow().date()
+        today = datetime.now(UTC).date()
 
         if to_date is None:
             to_date = today
