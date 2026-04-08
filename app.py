@@ -557,7 +557,7 @@ def main() -> None:
 
         df = to_dataframe(snapshot.rows)
         st.subheader("수집 데이터 미리보기")
-        st.dataframe(df.head(50), use_container_width=True)
+        st.dataframe(df.head(50), width="stretch")
 
         csv_data = df.to_csv(index=False).encode("utf-8-sig")
         filename = f"google_shopping_reviews_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
