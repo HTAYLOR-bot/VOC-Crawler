@@ -29,6 +29,7 @@ FINAL_COLUMNS = [
     "날짜",
     "리뷰 내용",
     "출처 웹사이트",
+    "Google 상품명",
 ]
 
 _SHARED_BROWSER_LOCK = threading.Lock()
@@ -1135,6 +1136,9 @@ class GoogleShoppingCrawler:
         self.base_crawl_date = datetime.now().date()
         self.expected_review_count: Optional[int] = None
         self.start_boundary_logged = False
+        self.google_product_name: str = ""
+        self.sort_confirmed_once: bool = False
+        self.allow_unsorted_extraction: bool = False
 
     def log(self, message: str):
         self.logger.log(message)
@@ -1199,9 +1203,18 @@ class GoogleShoppingCrawler:
         self.handle_verification_if_needed(page, "select_product")
         self.open_user_reviews(page)
         self.handle_verification_if_needed(page, "open_user_reviews")
-        self.sort_most_recent(page)
-        self.handle_verification_if_needed(page, "sort_most_recent")
-        self.confirm_sort_before_extract(page)
+        try:
+            self.sort_most_recent(page)
+            self.handle_verification_if_needed(page, "sort_most_recent")
+            self.confirm_sort_before_extract(page)
+            self.sort_confirmed_once = True
+        except Exception as exc:
+            msg = str(exc)
+            if ("정렬 버튼" in msg) or ("By most recent" in msg) or ("Most recent" in msg):
+                self.allow_unsorted_extraction = True
+                self.log(f"경고: 고객 리뷰 화면에 정렬 버튼이 없거나 최신순 변경을 확인하지 못했습니다. 현재 정렬 상태 그대로 리뷰 추출을 진행합니다. ({msg})")
+            else:
+                raise
         self.harvest_reviews(page)
         return self.rows
 
@@ -1432,6 +1445,72 @@ class GoogleShoppingCrawler:
                         continue
         return None
 
+    def capture_google_product_name(self, page: Page, fallback_text: str = "") -> str:
+        try:
+            viewport = page.viewport_size or {"width": 1400, "height": 900}
+        except Exception:
+            viewport = {"width": 1400, "height": 900}
+        width = float((viewport or {}).get("width") or 1400)
+        selectors = ["h1", "h2", "h3", "h4", "button", "div", "span", "a"]
+        best = ""
+        best_score = None
+        brand_norm = normalize_match_text(self.cfg.brand)
+        product_norm = normalize_match_text(self.cfg.product_name)
+        def score_text(t: str, x: float, y: float, w: float, h: float):
+            n = normalize_match_text(t)
+            if not t or len(t) < 6 or len(t) > 220:
+                return None
+            if x < width * 0.55:
+                return None
+            lower = normalize_text(t)
+            if any(bad in lower for bad in ["user reviews", "sort by", "all reviews", "more reviews", "free delivery", "walmart", "tire rack", "tires easy", "bestwheelsonline"]):
+                return None
+            if re.search(r"(?:us\$|\$|free delivery|reviews?|stars?)", lower):
+                return None
+            score = 0
+            if brand_norm and brand_norm in n:
+                score += 300
+            if product_norm and product_norm in n:
+                score += 400
+            if re.search(r"\b\d{3}/\d{2,3}r\d{2}[a-z0-9-]*\b", lower):
+                score += 70
+            if re.search(r"\b[a-z]{0,6}\d[a-z0-9-]*\b", lower):
+                score += 40
+            score += max(0, 300 - int(y))
+            score += int(min(w, 800) / 4)
+            score += int(min(h, 120) / 3)
+            return score
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = min(locator.count(), 160)
+            except Exception:
+                count = 0
+            for idx in range(count):
+                try:
+                    item = locator.nth(idx)
+                    if not item.is_visible():
+                        continue
+                    txt = clean_text(item.inner_text(timeout=500))
+                    if not txt:
+                        continue
+                    box = item.bounding_box() or {}
+                except Exception:
+                    continue
+                s = score_text(txt, float(box.get('x') or 0), float(box.get('y') or 0), float(box.get('width') or 0), float(box.get('height') or 0))
+                if s is None:
+                    continue
+                if best_score is None or s > best_score:
+                    best_score = s
+                    best = txt
+        if best:
+            return best
+        fb = clean_text(fallback_text)
+        if fb:
+            fb = re.split(r"\s+(?:us\$|\$|free delivery|walmart|tire rack|tires easy|bestwheelsonline|carid\.com|element wheels)\b", fb, maxsplit=1, flags=re.I)[0].strip()
+            return fb
+        return ""
+
     def select_product(self, page: Page):
         patterns = product_query_patterns(self.cfg.brand, self.cfg.product_name)
         self.log(f"상품 후보 검색 패턴: {patterns}")
@@ -1470,6 +1549,9 @@ class GoogleShoppingCrawler:
                 if self.expected_review_count:
                     self.log(f"선택 상품 리뷰 개수(검색 카드 기준): {self.expected_review_count}개")
                 page.wait_for_timeout(2500)
+                self.google_product_name = self.capture_google_product_name(page, fallback_text=str(cand.get('text', '')))
+                if self.google_product_name:
+                    self.log(f"Google 상품명 추출: {self.google_product_name[:180]}")
                 break
         if not clicked:
             raise RuntimeError("상품 후보 클릭에 실패했습니다.")
@@ -1793,6 +1875,9 @@ class GoogleShoppingCrawler:
 
 
     def confirm_sort_before_extract(self, page: Page):
+        if self.allow_unsorted_extraction:
+            self.log("리뷰 추출 직전 정렬 재확인 생략: 정렬 버튼 없음/미확인 상태에서 그대로 진행")
+            return
         if not self.is_most_recent_selected(page):
             visible_now = self.get_sort_state_texts(page)
             if visible_now:
@@ -1909,33 +1994,37 @@ class GoogleShoppingCrawler:
         if client_height <= 0:
             return 0
         start_top = 0 if full else max(0, original_top - int(client_height * 1.8))
-        step = max(int(client_height * 0.58), 260)
-        positions = []
-        pos = start_top
-        while pos <= max_top:
-            positions.append(pos)
-            pos += step
-        if max_top not in positions:
-            positions.append(max_top)
+        step = max(int(client_height * (0.24 if full else 0.42)), 140 if full else 220)
+        offsets = [0] if not full else [0, max(40, step // 2)]
         added_total = 0
         if reason:
             self.log(f"리뷰 패널 스윕 시작: {reason} | 구간 {start_top}~{max_top}")
-        for idx, pos in enumerate(positions):
-            maybe_checkpoint(self.cfg.control_hook)
-            self.set_review_panel_scroll(page, pos)
-            page.wait_for_timeout(520 if idx == 0 else 420)
-            self.expand_review_bodies(page)
-            try:
-                extracted = page.evaluate(EXTRACT_REVIEWS_JS) or []
-            except Exception as exc:
-                self.log(f"경고: 스윕 중 리뷰 추출 오류가 발생했지만 계속합니다. ({exc})")
-                extracted = []
-            added = self.merge_rows(extracted)
-            if added:
-                added_total += added
-                self.log(f"리뷰 스윕 추가 수집: +{added}건 / 누적 {len(self.rows)}건")
-                if self.cfg.partial_flush:
-                    self.cfg.partial_flush(self.rows)
+        for pass_idx, offset in enumerate(offsets):
+            positions = []
+            pos = start_top + offset
+            while pos <= max_top:
+                positions.append(pos)
+                pos += step
+            if max_top not in positions:
+                positions.append(max_top)
+            for idx, pos in enumerate(positions):
+                maybe_checkpoint(self.cfg.control_hook)
+                self.set_review_panel_scroll(page, pos)
+                page.wait_for_timeout(620 if idx == 0 else 480)
+                self.expand_review_bodies(page)
+                try:
+                    extracted = page.evaluate(EXTRACT_REVIEWS_JS) or []
+                except Exception as exc:
+                    self.log(f"경고: 스윕 중 리뷰 추출 오류가 발생했지만 계속합니다. ({exc})")
+                    extracted = []
+                added = self.merge_rows(extracted)
+                if added:
+                    added_total += added
+                    self.log(f"리뷰 스윕 추가 수집: +{added}건 / 누적 {len(self.rows)}건")
+                    if self.cfg.partial_flush:
+                        self.cfg.partial_flush(self.rows)
+                if self.should_early_stop_on_start_date():
+                    break
             if self.should_early_stop_on_start_date():
                 break
         # 다음 More reviews 클릭을 위해 가능한 아래쪽으로 복귀
@@ -2315,15 +2404,21 @@ class GoogleShoppingCrawler:
                     self.log("명령에 의한 리뷰추출 종료 조건이 충족되어 현재 상품 크롤링을 종료합니다. (idle 한계 도달)")
                     break
 
+        self.set_review_panel_scroll(page, 0)
+        page.wait_for_timeout(500)
         final_sweep_added = self.sweep_loaded_reviews_in_panel(page, reason="최종 전체 패널 스윕", full=True)
+        self.set_review_panel_scroll(page, 0)
+        page.wait_for_timeout(500)
+        second_sweep_added = self.sweep_loaded_reviews_in_panel(page, reason="누락 방지용 최종 재스캔", full=True)
+        total_final_sweep_added = final_sweep_added + second_sweep_added
         if self.should_finish_commanded_extraction(
             more_button_visible=bool((self.get_more_reviews_status(page) or {}).get("visible")),
             missing_more_confirm=5,
             old_boundary_reached=old_boundary_reached,
         ):
             self.log("최종 스윕 이후 명령에 의한 리뷰추출 완료로 판단되어 크롤링을 종료합니다.")
-        if final_sweep_added:
-            self.log(f"최종 전체 패널 스윕으로 추가 확보: +{final_sweep_added}건 / 누적 {len(self.rows)}건")
+        if total_final_sweep_added:
+            self.log(f"최종 전체 패널 스윕/재스캔으로 추가 확보: +{total_final_sweep_added}건 / 누적 {len(self.rows)}건")
         self.rows = self.rows_in_final_range()
         for idx, row in enumerate(self.rows, start=1):
             row["No."] = idx
@@ -2388,6 +2483,7 @@ class GoogleShoppingCrawler:
                 "날짜": review_date_str,
                 "리뷰 내용": review_text,
                 "출처 웹사이트": source,
+                "Google 상품명": self.google_product_name,
             }
             self.rows.append(row)
             added += 1
@@ -2513,6 +2609,7 @@ def crawl_google_shopping_reviews(
                 row.get("날짜", ""),
                 row.get("리뷰 내용", ""),
                 row.get("출처 웹사이트", ""),
+                row.get("Google 상품명", ""),
             )
             if key in combined_seen:
                 continue

@@ -104,7 +104,6 @@ class JobState:
         final_message = message or "Google verification이 필요합니다. 브라우저에서 확인을 완료한 뒤 Resume을 누르세요."
         self.pause_event.clear()
         self.set_status("verification_required", final_message)
-        self.append_log(final_message)
 
     def request_cancel(self, delete_requested: bool = False):
         self.delete_requested = bool(delete_requested)
