@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Google Shopping Review Crawler</title>
+  <style>
+    :root {
+      --bg:#f5f7fb; --card:#ffffff; --line:#d8e0eb; --text:#0f172a; --muted:#64748b;
+      --primary:#2563eb; --primary2:#1d4ed8; --ok:#059669; --warn:#d97706; --err:#dc2626;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:linear-gradient(180deg,#eef4ff 0%, var(--bg) 100%); color:var(--text); font-family:Inter,Arial,sans-serif; }
+    .wrap { max-width:1360px; margin:0 auto; padding:24px; }
+    .hero { background:linear-gradient(135deg,#0f172a,#1e3a8a); color:#fff; border-radius:24px; padding:28px; box-shadow:0 14px 42px rgba(15,23,42,.18); }
+    .hero h1 { margin:0 0 10px; font-size:34px; }
+    .hero p { margin:0; font-size:15px; line-height:1.7; color:#dbeafe; }
+    .badge-row { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }
+    .badge { background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.18); border-radius:999px; padding:8px 12px; font-size:12px; font-weight:700; }
+    .grid { display:grid; grid-template-columns:460px 1fr; gap:18px; margin-top:18px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:22px; padding:22px; box-shadow:0 12px 34px rgba(15,23,42,.06); }
+    h2 { margin:0 0 6px; font-size:22px; }
+    .sub { color:var(--muted); font-size:14px; line-height:1.6; }
+    .field { margin-top:16px; }
+    label { display:block; margin-bottom:8px; font-weight:800; font-size:14px; }
+    input[type="text"] { width:100%; border:1px solid var(--line); border-radius:14px; padding:13px 14px; font-size:15px; outline:none; }
+    input[type="text"]:focus { border-color:#93c5fd; box-shadow:0 0 0 4px rgba(37,99,235,.10); }
+    .inline-2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .toggle { display:flex; align-items:center; gap:10px; font-size:14px; font-weight:700; margin-top:14px; color:#334155; }
+    .toggle input { width:18px; height:18px; }
+    .btn-row { display:flex; flex-wrap:wrap; gap:10px; margin-top:18px; }
+    button, .download-btn { border:none; border-radius:14px; padding:12px 16px; font-size:14px; font-weight:800; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; }
+    .btn-primary { background:linear-gradient(135deg,var(--primary),var(--primary2)); color:#fff; }
+    .btn-secondary { background:#eef2f7; color:#0f172a; }
+    .btn-warn { background:#fff7ed; color:var(--warn); border:1px solid #fed7aa; }
+    .btn-ok { background:#ecfdf5; color:var(--ok); border:1px solid #bbf7d0; }
+    .btn-danger { background:#fef2f2; color:var(--err); border:1px solid #fecaca; }
+    .btn-disabled { opacity:.5; pointer-events:none; }
+    .status-head { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .status-badge { padding:10px 14px; border-radius:999px; font-size:12px; font-weight:800; }
+    .queued,.running { background:#eff6ff; color:var(--primary); }
+    .paused,.cancelling,.verification_required { background:#fff7ed; color:var(--warn); }
+    .completed { background:#ecfdf5; color:var(--ok); }
+    .failed,.cancelled,.deleted { background:#fef2f2; color:var(--err); }
+    .progress-wrap { margin-top:16px; height:14px; border-radius:999px; background:#edf2f7; overflow:hidden; border:1px solid #dde5f0; }
+    .progress-bar { height:100%; width:0; background:linear-gradient(90deg,#2563eb,#22c55e); transition:width .3s ease; }
+    .metrics { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; margin-top:16px; }
+    .metric { border:1px solid var(--line); border-radius:16px; padding:16px; }
+    .metric .k { font-size:12px; color:var(--muted); font-weight:800; text-transform:uppercase; letter-spacing:.04em; margin-bottom:8px; }
+    .metric .v { font-size:28px; font-weight:900; }
+    .logs { margin-top:16px; min-height:240px; max-height:380px; overflow:auto; background:#0f172a; color:#cbd5e1; border-radius:16px; padding:14px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; }
+    .download-box { margin-top:16px; padding:16px; border:1px solid var(--line); border-radius:16px; background:#f8fbff; display:none; }
+    .download-btn { background:#e0ecff; color:#1d4ed8; }
+    .help { margin-top:10px; color:var(--muted); font-size:12px; line-height:1.65; }
+    .table-wrap { overflow:auto; border:1px solid var(--line); border-radius:16px; background:#fff; }
+    table { width:100%; border-collapse:collapse; min-width:760px; }
+    th, td { padding:12px 14px; border-bottom:1px solid #eef2f7; font-size:13px; text-align:left; vertical-align:top; }
+    th { background:#f8fafc; color:#475569; font-weight:800; position:sticky; top:0; }
+    .empty { padding:14px; border:1px dashed var(--line); border-radius:14px; color:var(--muted); background:rgba(255,255,255,.6); }
+    .guide-box { margin-top:14px; border:1px solid #dbeafe; background:#eff6ff; border-radius:16px; padding:14px; color:#1e3a8a; font-size:12px; line-height:1.7; }
+    .footer { margin-top:14px; color:var(--muted); font-size:12px; line-height:1.65; }
+    @media (max-width: 1120px) { .grid { grid-template-columns:1fr; } }
+    @media (max-width: 700px) { .inline-2 { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>Google Shopping Review Crawler</h1>
+      <p>브랜드명 + 상품명(복수 가능)을 입력하면 Google Shopping 미국 화면에서 해당 상품 리뷰를 순차적으로 수집합니다. 시작일 / 종료일을 직접 입력할 수 있고, 종료일을 비우면 오늘까지 수집합니다.</p>
+      <div class="badge-row">
+        <div class="badge">Brand + Product</div>
+        <div class="badge">Date Range</div>
+        <div class="badge">Most Recent / 최신순</div>
+        <div class="badge">More Reviews / 리뷰 더보기</div>
+        <div class="badge">CSV Download</div>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>크롤링 설정</h2>
+        <div class="sub">검색은 대소문자 구분 없이 처리되며, 날짜는 <b>YYYY.MM.DD</b> / <b>YYYY-MM-DD</b> / <b>YYYY/MM/DD</b> 형식을 지원합니다.</div>
+
+        <div class="field">
+          <label for="brand">브랜드명</label>
+          <input id="brand" type="text" placeholder="예: Hankook" />
+        </div>
+
+        <div class="field">
+          <label for="productName">상품명</label>
+          <input id="productName" type="text" placeholder="예: iON evo AS SUV, iON evo AS / Ventus S1 evo Z A/S" />
+        </div>
+
+        <div class="inline-2">
+          <div class="field">
+            <label for="startDate">리뷰 시작 날짜</label>
+            <input id="startDate" type="text" placeholder="예: 2025.12.01" />
+          </div>
+          <div class="field">
+            <label for="endDate">리뷰 끝 날짜</label>
+            <input id="endDate" type="text" placeholder="예: 2026.01.01 (비우면 오늘까지)" />
+          </div>
+        </div>
+
+        <label class="toggle"><input id="headful" type="checkbox" /> 브라우저 창을 보면서 실행 (Google UI 확인용)</label>
+
+        <div class="btn-row">
+          <button id="startBtn" class="btn-primary">크롤링 시작</button>
+          <button id="exampleBtn" class="btn-secondary">예시 입력</button>
+        </div>
+
+        <div class="help">
+          - Google 화면 구조가 바뀌면 headful 모드에서 확인하면서 다시 실행하는 편이 안전합니다.<br/>
+          - 리뷰 날짜가 <b>6 days ago / 1 week ago / 3달 전 / 7주 전</b>처럼 보이면, 실행일 기준으로 실제 날짜를 계산해 저장합니다.<br/>
+          - 동일 상품이 여러 쇼핑 카드로 보이더라도, 리뷰 수가 동일한 카드 중 1개만 선택해서 수집하도록 설계했습니다.<br/>
+          - 상품명은 <b>콤마(,)</b> 또는 <b>공백을 포함한 슬래시( / )</b>로 여러 개 입력할 수 있으며, 입력 순서대로 연속 수집합니다.<br/>
+          - 우측 패널의 <b>사용자 리뷰</b> → <b>관련성순</b> → <b>최신순</b> → <b>리뷰 더보기</b> 흐름에서, <b>최신순 상태가 실제로 확인되지 않으면 리뷰 추출을 시작하지 않도록</b> 유지했습니다.<br/>
+          - 각 리뷰의 <b>본문 더보기 / Read more / 더보기</b>도 눌러서, 가능한 경우 리뷰 전문을 CSV에 넣도록 보강했습니다.
+        </div>
+
+        <div class="guide-box">
+          <b>캡처 예시 기준 컬럼 매핑</b><br/>
+          계정: <b>Dr1brx</b> / 별점: <b>5</b> / 날짜: <b>3주 전 → 실행일 기준 실제 날짜</b><br/>
+          리뷰 내용: <b>별점 바로 아래 본문 전체</b><br/>
+          출처: <b>lesschwab.com</b><br/>
+          리뷰 본문은 <b>현지 언어 그대로</b> 저장하며, 줄바꿈이 있으면 CSV에도 줄바꿈 형태로 보존합니다.
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="status-head">
+          <div>
+            <h2>작업 상태</h2>
+            <div class="sub" id="statusMessage">아직 실행되지 않았습니다.</div>
+          </div>
+          <div id="statusBadge" class="status-badge queued">READY</div>
+        </div>
+
+        <div class="progress-wrap"><div id="progressBar" class="progress-bar"></div></div>
+
+        <div class="metrics">
+          <div class="metric"><div class="k">Progress</div><div class="v" id="progressValue">0%</div></div>
+          <div class="metric"><div class="k">Reviews</div><div class="v" id="reviewCountValue">0</div></div>
+          <div class="metric"><div class="k">Brand</div><div class="v" id="brandValue">-</div></div>
+          <div class="metric"><div class="k">Product</div><div class="v" id="productValue">-</div></div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn-warn" id="pauseBtn">일시 중단</button>
+          <button class="btn-ok" id="resumeBtn">인증 완료 또는 일시 중단 후 Resume</button>
+          <button class="btn-secondary" id="copyLogsBtn">로그 복사</button>
+          <button class="btn-danger" id="stopDeleteBtn">중단 후 진행 파일 삭제</button>
+        </div>
+
+        <div id="verificationBox" class="empty" style="display:none; margin-top:16px; border-color:#fed7aa; background:#fff7ed; color:#92400e;">
+          Google verification / CAPTCHA가 감지됐습니다. 브라우저 창에서 직접 해결한 뒤 <b>인증 완료 또는 일시 중단 후 Resume</b> 버튼을 누르세요.
+        </div>
+
+        <div class="download-box" id="downloadBox">
+          <h3 style="margin:0 0 10px;">CSV</h3>
+          <a id="downloadBtn" class="download-btn" href="#">CSV 다운로드</a>
+          <div class="footer">진행 중에도 부분 CSV를 다운로드할 수 있습니다.</div>
+          <div class="footer">verification 또는 자동 수집 정지 후에도 Resume을 누르면 직전 지점부터 이어서 수집합니다.</div>
+        </div>
+
+        <div class="logs" id="logs">대기 중...</div>
+      </section>
+    </div>
+
+    <section class="card" style="margin-top:18px;">
+      <h2>미리보기</h2>
+      <div class="sub">실시간으로 누적된 리뷰 일부를 보여줍니다.</div>
+      <div id="previewEmpty" class="empty">아직 결과가 없습니다.</div>
+      <div id="previewWrap" class="table-wrap" style="display:none; margin-top:14px;">
+        <table>
+          <thead>
+            <tr id="previewHeadRow"></tr>
+          </thead>
+          <tbody id="previewBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let currentJobId = null;
+    let pollTimer = null;
+
+    function setBadge(status) {
+      const el = $('statusBadge');
+      el.className = `status-badge ${status || 'queued'}`;
+      el.textContent = (status || 'ready').toUpperCase();
+    }
+
+    function setProgress(value) {
+      const num = Number(value || 0).toFixed(1);
+      $('progressBar').style.width = `${num}%`;
+      $('progressValue').textContent = `${num}%`;
+    }
+
+    function setDownload(url) {
+      const box = $('downloadBox');
+      const btn = $('downloadBtn');
+      if (url) {
+        btn.href = url;
+        box.style.display = 'block';
+      } else {
+        btn.href = '#';
+        box.style.display = 'none';
+      }
+    }
+
+    function renderPreview(rows) {
+      const empty = $('previewEmpty');
+      const wrap = $('previewWrap');
+      const head = $('previewHeadRow');
+      const body = $('previewBody');
+      if (!rows || !rows.length) {
+        empty.style.display = 'block';
+        wrap.style.display = 'none';
+        head.innerHTML = '';
+        body.innerHTML = '';
+        return;
+      }
+      const cols = Object.keys(rows[0]);
+      head.innerHTML = cols.map((c) => `<th>${c}</th>`).join('');
+      const esc = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br/>');
+      body.innerHTML = rows.map((row) => `<tr>${cols.map((c) => `<td>${esc(row[c])}</td>`).join('')}</tr>`).join('');
+      empty.style.display = 'none';
+      wrap.style.display = 'block';
+    }
+
+    function applyStatus(data) {
+      setBadge(data.status);
+      setProgress(data.percent || 0);
+      $('statusMessage').textContent = data.message || '-';
+      $('verificationBox').style.display = data.status === 'verification_required' ? 'block' : 'none';
+      $('reviewCountValue').textContent = data.row_count || 0;
+      $('brandValue').textContent = data.brand || '-';
+      $('productValue').textContent = data.product_name || '-';
+      $('logs').textContent = (data.logs || []).join('\n') || '로그 없음';
+      $('logs').scrollTop = $('logs').scrollHeight;
+      setDownload(data.download_url || null);
+      renderPreview(data.preview_rows || []);
+    }
+
+    async function pollStatus() {
+      if (!currentJobId) return;
+      const res = await fetch(`/api/status/${currentJobId}`);
+      const data = await res.json();
+      applyStatus(data);
+      if (['completed','failed','cancelled','deleted'].includes(data.status)) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    async function startJob() {
+      const payload = {
+        brand: $('brand').value.trim(),
+        product_name: $('productName').value.trim(),
+        start_date: $('startDate').value.trim(),
+        end_date: $('endDate').value.trim(),
+        headful: $('headful').checked,
+      };
+      if (!payload.brand) { alert('브랜드명을 입력하세요.'); return; }
+      if (!payload.product_name) { alert('상품명을 입력하세요.'); return; }
+      const res = await fetch('/api/start', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      currentJobId = data.job_id;
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollStatus, 1500);
+      await pollStatus();
+    }
+
+    async function simplePost(url, payload={}) {
+      if (!currentJobId) return;
+      await fetch(url, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      await pollStatus();
+    }
+
+    $('startBtn').addEventListener('click', startJob);
+    $('pauseBtn').addEventListener('click', () => simplePost(`/api/pause/${currentJobId}`));
+    $('resumeBtn').addEventListener('click', () => simplePost(`/api/resume/${currentJobId}`));
+    $('stopDeleteBtn').addEventListener('click', () => simplePost(`/api/cancel/${currentJobId}`, {delete_requested:true}));
+    $('copyLogsBtn').addEventListener('click', async () => {
+      const text = $('logs').textContent || '';
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const area = document.createElement('textarea');
+          area.value = text;
+          area.style.position = 'fixed';
+          area.style.left = '-9999px';
+          document.body.appendChild(area);
+          area.focus();
+          area.select();
+          document.execCommand('copy');
+          document.body.removeChild(area);
+        }
+        alert('로그를 복사했습니다.');
+      } catch (e) {
+        alert('로그 복사에 실패했습니다.');
+      }
+    });
+    $('exampleBtn').addEventListener('click', () => {
+      $('brand').value = 'Hankook';
+      $('productName').value = 'iON evo AS SUV, Ventus iON evo AS';
+      $('startDate').value = '2025.12.01';
+      $('endDate').value = '';
+      $('headful').checked = true;
+    });
+  </script>
+</body>
+</html>
